@@ -1,0 +1,79 @@
+replicaCount: 2
+
+image:
+  repository: harbor.example.com/example-platform/example-app
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: example-app-tls
+      hosts:
+        - app.example.com
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+

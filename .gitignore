@@ -1,0 +1,34 @@
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.tmp
+*.swp
+
+# Build output
+node_modules/
+coverage/
+dist/
+bin/
+obj/
+target/
+TestResults/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig
