@@ -1,0 +1,56 @@
+pipeline {
+    agent { label 'linux-terraform' }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+    tools { terraform 'terraform-1.8' }
+    parameters {
+        choice(name: 'TARGET_ENVIRONMENT', choices: ['development', 'staging', 'production'], description: 'Variable file and state environment')
+        string(name: 'TF_STATE_BUCKET', defaultValue: 'terraform-state.example.com', description: 'Existing S3 state bucket')
+        string(name: 'TF_LOCK_TABLE', defaultValue: 'terraform-locks', description: 'Existing DynamoDB lock table')
+        booleanParam(name: 'APPLY', defaultValue: false, description: 'Allow an approved apply from main')
+    }
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        AWS_SHARED_CREDENTIALS_FILE = credentials('aws-terraform-credentials-file')
+    }
+    stages {
+        stage('Checkout') { steps { checkout scm } }
+        stage('Format') { steps { sh 'terraform -chdir=terraform fmt -check -recursive -diff' } }
+        stage('Initialize') {
+            steps {
+                retry(2) {
+                    sh 'terraform -chdir=terraform init -upgrade=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=devops-pipeline-examples/$TARGET_ENVIRONMENT.tfstate" -backend-config="region=us-east-1" -backend-config="dynamodb_table=$TF_LOCK_TABLE" -backend-config="encrypt=true"'
+                }
+            }
+        }
+        stage('Validate') { steps { sh 'terraform -chdir=terraform validate' } }
+        stage('Static Analysis') {
+            parallel {
+                stage('TFLint') { steps { sh 'tflint --chdir=terraform --recursive' } }
+                stage('Checkov') { steps { sh 'checkov --directory terraform --quiet --framework terraform' } }
+            }
+        }
+        stage('Plan') {
+            steps {
+                sh 'terraform -chdir=terraform plan -out=tfplan -var="environment=$TARGET_ENVIRONMENT"'
+                sh 'terraform -chdir=terraform show -no-color tfplan > terraform/plan.txt'
+                archiveArtifacts artifacts: 'terraform/plan.txt', fingerprint: true
+            }
+        }
+        stage('Approval') {
+            when { allOf { branch 'main'; expression { params.APPLY } } }
+            steps { timeout(time: 15, unit: 'MINUTES') { input message: "Apply to ${params.TARGET_ENVIRONMENT}?", ok: 'Apply' } }
+        }
+        stage('Apply') {
+            when { allOf { branch 'main'; expression { params.APPLY } } }
+            steps { sh 'terraform -chdir=terraform apply -auto-approve tfplan' }
+        }
+    }
+    post { always { cleanWs(deleteDirs: true, disableDeferredWipeout: true) } }
+}

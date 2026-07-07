@@ -1,0 +1,203 @@
+pipeline {
+    agent { label 'linux-docker' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds(abortPrevious: true)
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    tools { nodejs 'nodejs-20' }
+
+    parameters {
+        choice(name: 'DEPLOY_ENVIRONMENT', choices: ['none', 'development', 'staging', 'production'], description: 'GitOps environment to update')
+        string(name: 'HARBOR_HOST', defaultValue: 'harbor.example.com', description: 'Harbor hostname without protocol')
+        string(name: 'HARBOR_PROJECT', defaultValue: 'example-platform', description: 'Harbor project')
+        string(name: 'IMAGE_NAME', defaultValue: 'example-nodejs-app', description: 'Container repository name')
+        string(name: 'GITOPS_REPOSITORY', defaultValue: 'git@github.com:example-org/example-gitops.git', description: 'SSH clone URL')
+        string(name: 'ARGOCD_SERVER', defaultValue: 'argocd.example.com', description: 'ArgoCD hostname without protocol')
+        string(name: 'SMOKE_TEST_URL', defaultValue: 'https://app.example.com/healthz', description: 'Environment health endpoint')
+        booleanParam(name: 'RUN_SONAR_SCAN', defaultValue: true, description: 'Run SonarQube analysis and quality gate')
+    }
+
+    environment {
+        GITOPS_DIRECTORY = 'gitops-worktree'
+        VALUES_FILE = 'applications/example-nodejs-app/values.yaml'
+        ARGOCD_APP_PREFIX = 'example-nodejs-app'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHA = sh(script: 'git rev-parse --short=12 HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.GIT_SHA}-${env.BUILD_NUMBER}"
+                    env.IMAGE_REPOSITORY = "${params.HARBOR_HOST}/${params.HARBOR_PROJECT}/${params.IMAGE_NAME}"
+                    env.IMAGE_REF = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('npm ci') {
+            steps { retry(2) { sh 'npm ci --no-audit --no-fund' } }
+        }
+
+        stage('Lint') {
+            steps { sh 'npm run lint' }
+        }
+
+        stage('Unit Tests') {
+            steps { sh 'npm test -- --ci --coverage --reporters=default --reporters=jest-junit' }
+            post { always { junit testResults: 'junit.xml', allowEmptyResults: true } }
+        }
+
+        stage('SonarQube Scan') {
+            when { expression { params.RUN_SONAR_SCAN } }
+            steps {
+                withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                    withSonarQubeEnv('sonarqube') {
+                        sh 'npx sonar-scanner -Dsonar.token="$SONAR_TOKEN" -Dsonar.projectVersion="$IMAGE_TAG"'
+                    }
+                }
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build') {
+            steps { sh 'npm run build' }
+        }
+
+        stage('Docker Build') {
+            steps { sh 'docker build --pull --label org.opencontainers.image.revision="$GIT_SHA" --label org.opencontainers.image.version="$IMAGE_TAG" -t "$IMAGE_REF" .' }
+        }
+
+        stage('Docker Tag') {
+            when { branch 'main' }
+            steps { sh 'docker tag "$IMAGE_REF" "$IMAGE_REPOSITORY:main"' }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    int scanStatus = sh(script: 'trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --format json --output trivy-report.json "$IMAGE_REF"', returnStatus: true)
+                    archiveArtifacts artifacts: 'trivy-report.json', fingerprint: true
+                    if (scanStatus != 0) {
+                        error('Trivy found fixable high or critical vulnerabilities.')
+                    }
+                }
+            }
+        }
+
+        stage('Push Image') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENVIRONMENT != 'none' }
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'harbor-robot-account', usernameVariable: 'HARBOR_USERNAME', passwordVariable: 'HARBOR_PASSWORD')]) {
+                    retry(3) {
+                        sh '''
+                            set +x
+                            printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" --username "$HARBOR_USERNAME" --password-stdin
+                            set -x
+                            docker push "$IMAGE_REF"
+                            docker push "$IMAGE_REPOSITORY:main"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Update GitOps Repository') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                sshagent(credentials: ['gitops-deploy-key']) {
+                    retry(2) {
+                        sh '''
+                            rm -rf "$GITOPS_DIRECTORY"
+                            git clone --depth 1 "$GITOPS_REPOSITORY" "$GITOPS_DIRECTORY"
+                            test -f "$GITOPS_DIRECTORY/environments/$DEPLOY_ENVIRONMENT/$VALUES_FILE"
+                            yq -i '.image.repository = strenv(IMAGE_REPOSITORY) | .image.tag = strenv(IMAGE_TAG)' "$GITOPS_DIRECTORY/environments/$DEPLOY_ENVIRONMENT/$VALUES_FILE"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Commit image tag update') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                dir("${env.GITOPS_DIRECTORY}") {
+                    sh '''
+                        git config user.name "Jenkins GitOps Automation"
+                        git config user.email "jenkins@example.com"
+                        git add "environments/$DEPLOY_ENVIRONMENT/$VALUES_FILE"
+                        git diff --cached --check
+                        git commit -m "deploy($DEPLOY_ENVIRONMENT): example-nodejs-app $IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Push GitOps Repository') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                sshagent(credentials: ['gitops-deploy-key']) {
+                    dir("${env.GITOPS_DIRECTORY}") { retry(3) { sh 'git push origin HEAD:main' } }
+                }
+            }
+        }
+
+        stage('ArgoCD Sync') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                withCredentials([string(credentialsId: 'argocd-automation-token', variable: 'ARGOCD_AUTH_TOKEN')]) {
+                    retry(2) {
+                        sh 'argocd app sync "$ARGOCD_APP_PREFIX-$DEPLOY_ENVIRONMENT" --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web'
+                    }
+                }
+            }
+        }
+
+        stage('ArgoCD Wait') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                withCredentials([string(credentialsId: 'argocd-automation-token', variable: 'ARGOCD_AUTH_TOKEN')]) {
+                    timeout(time: 15, unit: 'MINUTES') {
+                        sh 'argocd app wait "$ARGOCD_APP_PREFIX-$DEPLOY_ENVIRONMENT" --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_AUTH_TOKEN" --grpc-web --sync --health --operation --timeout 840'
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps { retry(5) { sh 'curl --fail --silent --show-error --connect-timeout 5 --max-time 15 "$SMOKE_TEST_URL"' } }
+        }
+
+        stage('Slack Notification') {
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENVIRONMENT != 'none' } } }
+            steps {
+                slackSend channel: '#deployments', color: 'good', message: "SUCCESS ${env.JOB_NAME} #${env.BUILD_NUMBER}: ${env.IMAGE_TAG} -> ${params.DEPLOY_ENVIRONMENT} (${env.BUILD_URL})"
+            }
+        }
+    }
+
+    post {
+        failure { slackSend channel: '#deployments', color: 'danger', message: "FAILED ${env.JOB_NAME} #${env.BUILD_NUMBER}: ${params.DEPLOY_ENVIRONMENT} (${env.BUILD_URL})" }
+        unstable { slackSend channel: '#deployments', color: 'warning', message: "UNSTABLE ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.BUILD_URL})" }
+        always {
+            sh 'docker logout "$HARBOR_HOST" >/dev/null 2>&1 || true'
+            sh 'if [ -n "${IMAGE_REF:-}" ]; then docker image rm "$IMAGE_REF" "$IMAGE_REPOSITORY:main" >/dev/null 2>&1 || true; fi'
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
+    }
+}

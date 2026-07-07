@@ -1,0 +1,36 @@
+pipeline {
+    agent { label 'linux-java' }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+    tools { jdk 'jdk-17'; maven 'maven-3.9' }
+    parameters {
+        booleanParam(name: 'RUN_SONAR_SCAN', defaultValue: true, description: 'Run analysis and enforce the quality gate')
+    }
+    stages {
+        stage('Checkout') { steps { checkout scm } }
+        stage('Verify') {
+            steps { sh 'mvn --batch-mode --no-transfer-progress clean verify' }
+            post { always { junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true } }
+        }
+        stage('SonarQube') {
+            when { expression { params.RUN_SONAR_SCAN } }
+            steps {
+                withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                    withSonarQubeEnv('sonarqube') {
+                        sh 'mvn --batch-mode --no-transfer-progress sonar:sonar -Dsonar.token="$SONAR_TOKEN"'
+                    }
+                }
+                timeout(time: 10, unit: 'MINUTES') { waitForQualityGate abortPipeline: true }
+            }
+        }
+        stage('Archive') {
+            steps { archiveArtifacts artifacts: 'target/*.jar', excludes: 'target/*-sources.jar,target/*-javadoc.jar', fingerprint: true }
+        }
+    }
+    post { always { cleanWs(deleteDirs: true, disableDeferredWipeout: true) } }
+}

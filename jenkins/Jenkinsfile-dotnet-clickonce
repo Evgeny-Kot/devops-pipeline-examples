@@ -1,0 +1,110 @@
+pipeline {
+    agent { label 'windows-msbuild' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    tools {
+        nuget 'nuget-6'
+        msbuild 'msbuild-2022'
+    }
+
+    parameters {
+        string(name: 'SOLUTION_FILE', defaultValue: 'src/ExampleApp.sln', description: 'Solution path relative to the workspace')
+        string(name: 'TEST_PROJECT', defaultValue: 'tests/ExampleApp.Tests/ExampleApp.Tests.csproj', description: 'Unit test project path')
+        string(name: 'PUBLISH_PROJECT', defaultValue: 'src/ExampleApp/ExampleApp.csproj', description: 'ClickOnce project path')
+        string(name: 'PUBLISH_URL', defaultValue: 'https://downloads.example.com/example-app/', description: 'Public ClickOnce installation URL')
+        choice(name: 'BUILD_CONFIGURATION', choices: ['Release', 'Debug'], description: 'MSBuild configuration')
+    }
+
+    environment {
+        BUILD_VERSION = "1.0.${BUILD_NUMBER}.0"
+        PACKAGES_DIR = "${WORKSPACE}\\.packages"
+        RESULTS_DIR = "${WORKSPACE}\\TestResults"
+        PUBLISH_DIR = "${WORKSPACE}\\artifacts\\clickonce"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Clean Workspace') {
+            steps {
+                // Preserve the checkout while removing output from a resumed or reused workspace.
+                bat '''
+                    if exist artifacts rmdir /s /q artifacts
+                    if exist TestResults rmdir /s /q TestResults
+                    if exist .packages rmdir /s /q .packages
+                '''
+            }
+        }
+
+        stage('NuGet Restore') {
+            steps {
+                retry(2) {
+                    bat 'nuget restore "%SOLUTION_FILE%" -PackagesDirectory "%PACKAGES_DIR%" -NonInteractive'
+                }
+            }
+        }
+
+        stage('MSBuild') {
+            steps {
+                bat '''msbuild "%SOLUTION_FILE%" /m /nr:false /t:Rebuild /p:Configuration=%BUILD_CONFIGURATION% /p:Version=%BUILD_VERSION% /p:FileVersion=%BUILD_VERSION% /p:ContinuousIntegrationBuild=true'''
+            }
+        }
+
+        stage('Run Unit Tests') {
+            steps {
+                bat '''
+                    if not exist "%RESULTS_DIR%" mkdir "%RESULTS_DIR%"
+                    dotnet test "%TEST_PROJECT%" --no-restore --configuration "%BUILD_CONFIGURATION%" --logger "junit;LogFilePath=%RESULTS_DIR%\\unit-tests.xml" --results-directory "%RESULTS_DIR%" --collect "XPlat Code Coverage"
+                '''
+            }
+        }
+
+        stage('Collect Test Results') {
+            steps {
+                junit testResults: 'TestResults/**/unit-tests.xml', keepLongStdio: true
+            }
+        }
+
+        stage('Code Coverage') {
+            steps {
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'TestResults/**/coverage.cobertura.xml']], qualityGates: [[threshold: 70.0, metric: 'LINE', baseline: 'PROJECT', unstable: true]]
+            }
+        }
+
+        stage('Publish ClickOnce') {
+            when { expression { params.BUILD_CONFIGURATION == 'Release' } }
+            steps {
+                bat '''msbuild "%PUBLISH_PROJECT%" /nr:false /t:Publish /p:Configuration=Release /p:ApplicationVersion=%BUILD_VERSION% /p:PublishDir="%PUBLISH_DIR%\\" /p:PublishUrl="%PUBLISH_URL%" /p:InstallUrl="%PUBLISH_URL%" /p:Install=true /p:UpdateEnabled=true /p:BootstrapperEnabled=true'''
+            }
+        }
+
+        stage('Archive Artifacts') {
+            when { expression { params.BUILD_CONFIGURATION == 'Release' } }
+            steps {
+                archiveArtifacts artifacts: 'artifacts/clickonce/**/*', fingerprint: true, onlyIfSuccessful: true
+            }
+        }
+    }
+
+    post {
+        success { echo "ClickOnce ${env.BUILD_VERSION} built successfully." }
+        unstable { echo 'Build completed with a quality or coverage warning.' }
+        failure { echo "Build failed: ${env.BUILD_URL}" }
+        unsuccessful {
+            // Publish partial results when the test process or a later stage fails.
+            junit testResults: 'TestResults/**/unit-tests.xml', allowEmptyResults: true, keepLongStdio: true
+        }
+        always {
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
+    }
+}
